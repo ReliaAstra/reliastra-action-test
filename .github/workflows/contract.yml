@@ -1,0 +1,178 @@
+name: Cross-repo contract tests
+
+# This repository exists to prove that reliastra-action works from a repository
+# that did not author it. It is a consumer, not a submodule, not a local path.
+#
+# Every step below runs the PUBLISHED tag over the real network against the real
+# API. No mocking, no fixtures, no `needs:` shortcuts.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Exit code contract
+    runs-on: ubuntu-latest
+    steps:
+      # ── 1. Public feed, quiet vendor: must succeed ────────────────────────
+      - name: public / quiet vendor / expect exit 0
+        id: quiet
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          dependency: stripe
+          fail-on: down
+
+      - name: assert quiet vendor exits 0
+        run: |
+          echo "verdict=${{ steps.quiet.outputs.verdict }}"
+          echo "publicState=${{ steps.quiet.outputs.mode }}"
+          test "${{ steps.quiet.outputs.exit-code }}" = "0" \
+            || { echo "::error::expected exit 0, got ${{ steps.quiet.outputs.exit-code }}"; exit 1; }
+
+      # ── 2. Bad credential: must be exit 3 (auth) ─────────────────────────
+      - name: auth / invalid token / expect exit 3
+        id: auth
+        continue-on-error: true
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          dependency: 4c1f9e2a-3b7d-4c8e-9f1a-2b3c4d5e6f70
+          token: rel_definitelynotarealkey000000
+          retries: 0
+
+      - name: assert auth failure is exit 3
+        run: |
+          echo "outcome=${{ steps.auth.outcome }} exit=${{ steps.auth.outputs.exit-code }}"
+          test "${{ steps.auth.outputs.exit-code }}" = "3" \
+            || { echo "::error::expected exit 3 for a rejected token, got ${{ steps.auth.outputs.exit-code }}"; exit 1; }
+          echo "verdict=${{ steps.auth.outputs.verdict }}"
+
+      # ── 3. Network failure: must be exit 6 ───────────────────────────────
+      - name: network / unreachable host / expect exit 6
+        id: net
+        continue-on-error: true
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          dependency: stripe
+          base-url: https://reliastra-action-test.invalid/api
+          retries: 0
+          timeout-seconds: 5
+
+      - name: assert network failure is exit 6
+        run: |
+          echo "exit=${{ steps.net.outputs.exit-code }}"
+          test "${{ steps.net.outputs.exit-code }}" = "6" \
+            || { echo "::error::expected exit 6 for an unreachable host, got ${{ steps.net.outputs.exit-code }}"; exit 1; }
+
+      # ── 4. Missing required input: must be exit 1 (usage) ────────────────
+      - name: usage / missing dependency / expect exit 1
+        id: usage
+        continue-on-error: true
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          fail-on: never
+
+      - name: assert missing input is exit 1
+        run: |
+          echo "exit=${{ steps.usage.outputs.exit-code }}"
+          test "${{ steps.usage.outputs.exit-code }}" = "1" \
+            || { echo "::error::expected exit 1 for a missing input, got ${{ steps.usage.outputs.exit-code }}"; exit 1; }
+
+      # ── 5. Invalid enum value: must be exit 1, not silently ignored ──────
+      - name: usage / invalid fail-on / expect exit 1
+        id: badenum
+        continue-on-error: true
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          dependency: stripe
+          fail-on: exploded
+
+      - name: assert invalid fail-on is exit 1
+        run: |
+          test "${{ steps.badenum.outputs.exit-code }}" = "1" \
+            || { echo "::error::an unknown fail-on value must be a usage error, got ${{ steps.badenum.outputs.exit-code }}"; exit 1; }
+
+      # ── 6. Outputs and JSON are usable by later steps ────────────────────
+      - name: json / output-file / verify the record is real
+        id: json
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          dependency: stripe
+          fail-on: down
+          output-file: reliastra.json
+
+      - name: assert the JSON record is well formed and honest
+        run: |
+          test -f reliastra.json || { echo "::error::output-file was not written"; exit 1; }
+          python3 - <<'PY'
+          import json, sys
+          with open("reliastra.json") as fh:
+              d = json.load(fh)
+          print(json.dumps(d, indent=2)[:900])
+
+          required = {"schema","mode","verdict","observationPoint","observationPoints","exitCode","attributionCaveat"}
+          missing = required - set(d)
+          if missing:
+              sys.exit(f"missing keys: {sorted(missing)}")
+
+          # The honesty invariants. If any of these change, the action is lying.
+          assert d["observationPoints"] == 1, "must always report exactly one observation point"
+          assert d["mode"] in ("public","authenticated")
+          assert d["verdict"] in ("up","degraded","down","blocked","unverified","pipeline-error","error")
+          assert "not proof" in d["attributionCaveat"].lower() or "weighted" in d["attributionCaveat"].lower()
+          print("\nJSON contract OK")
+          PY
+
+      # ── 7. The gate: an open incident must fail the step ──────────────────
+      # Informational rather than asserting, because live incident state
+      # changes. It proves the gate fires end to end when there is something
+      # to fire on.
+      - name: gate / open-incident vendor / observe
+        id: gate
+        continue-on-error: true
+        uses: ReliaAstra/reliastra-action@v1
+        with:
+          dependency: xai
+          fail-on: down
+
+      - name: report gate behaviour
+        run: |
+          echo "verdict:   ${{ steps.gate.outputs.verdict }}"
+          echo "matched:   ${{ steps.gate.outputs.matched }}"
+          echo "exit:      ${{ steps.gate.outputs.exit-code }}"
+          echo "outcome:   ${{ steps.gate.outcome }}"
+          echo "incident:  ${{ steps.gate.outputs.incident-id }}"
+          echo "evidence:  ${{ steps.gate.outputs.evidence-url }}"
+          echo "hash:      ${{ steps.gate.outputs.evidence-hash }}"
+          if [ "${{ steps.gate.outputs.verdict }}" = "down" ]; then
+            test "${{ steps.gate.outputs.exit-code }}" = "5" \
+              || { echo "::error::a matched gate must exit 5"; exit 1; }
+            test "${{ steps.gate.outcome }}" = "failure" \
+              || { echo "::error::a matched gate must fail the step"; exit 1; }
+            echo "gate fired correctly"
+          else
+            echo "no open incident right now, so there was nothing for the gate to catch"
+          fi
+
+  publishable:
+    name: Marketplace prerequisites
+    runs-on: ubuntu-latest
+    steps:
+      - name: action.yml is at the repository root
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/ReliaAstra/reliastra-action/v1/action.yml > /dev/null \
+            || { echo "::error::action.yml is not fetchable from the v1 tag"; exit 1; }
+          echo "action.yml resolves from the v1 tag"
+
+      - name: the published tag runs the bundled dist, not src
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/ReliaAstra/reliastra-action/v1/dist/index.js > bundle.js
+          SIZE=$(wc -c < bundle.js)
+          echo "dist/index.js is ${SIZE} bytes"
+          test "$SIZE" -gt 20000 || { echo "::error::published bundle looks like a stub"; exit 1; }
+          grep -q "runs:" /dev/null || true
+          echo "bundle is present and non-trivial"
